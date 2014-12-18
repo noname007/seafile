@@ -27,6 +27,7 @@
 #define UPDATE_TX_STATE_INTERVAL 1000 /* 1s */
 #define MAX_RUNNING_SYNC_TASKS 5
 #define CHECK_LOCKED_FILES_INTERVAL 10 /* 10s */
+#define CHECK_FOLDER_PERMS_INTERVAL 30 /* 30s */
 
 enum {
     SERVER_SIDE_MERGE_UNKNOWN = 0,
@@ -44,6 +45,10 @@ struct _HttpServerState {
     gboolean http_not_supported;
     int http_version;
     gboolean checking;
+
+    gboolean folder_perms_not_supported;
+    gint64 last_check_perms_time;
+    gboolean checking_folder_perms;
 };
 typedef struct _HttpServerState HttpServerState;
 
@@ -1986,6 +1991,7 @@ check_http_protocol (SeafSyncManager *mgr, SeafRepo *repo, gboolean *is_checking
                                                   repo->server_url);
     if (!state) {
         state = g_new0 (HttpServerState, 1);
+        state->host = g_strdup(repo->server_url);
         g_hash_table_insert (mgr->http_server_states,
                              g_strdup(repo->server_url), state);
     }
@@ -2266,14 +2272,127 @@ check_locked_files_done (void *vdata)
 
 #endif
 
+static void
+check_folder_perms_done (HttpFolderPerms *result, void *user_data)
+{
+    HttpServerState *server_state = user_data;
+    GList *ptr;
+    HttpFolderPermRes *res;
+
+    server_state->checking_folder_perms = FALSE;
+
+    if (!result->success) {
+        /* If on star-up we find that checking folder perms fails,
+         * we assume the server doesn't support it.
+         */
+        if (server_state->last_check_perms_time == 0)
+            server_state->folder_perms_not_supported = TRUE;
+        return;
+    }
+
+    for (ptr = result->results; ptr; ptr = ptr->next) {
+        res = ptr->data;
+
+        seaf_repo_manager_update_folder_perms (seaf->repo_mgr, res->repo_id,
+                                               FOLDER_PERM_TYPE_USER,
+                                               res->user_perms);
+        seaf_repo_manager_update_folder_perms (seaf->repo_mgr, res->repo_id,
+                                               FOLDER_PERM_TYPE_GROUP,
+                                               res->user_perms);
+        seaf_repo_manager_update_folder_perm_timestamp (seaf->repo_mgr,
+                                                        res->repo_id,
+                                                        res->timestamp);
+    }
+}
+
+static void
+check_folder_permissions_one_server (SeafSyncManager *mgr,
+                                     const char *host,
+                                     HttpServerState *server_state,
+                                     GList *repos)
+{
+    GList *ptr;
+    SeafRepo *repo;
+    char *token;
+    gint64 timestamp;
+    HttpFolderPermReq *req;
+    GList *reqeusts = NULL;
+
+    gint64 now = (gint64)time(NULL);
+
+    if (server_state->folder_perms_not_supported ||
+        server_state->checking_folder_perms)
+        return;
+
+    if (server_state->last_check_perms_time > 0 &&
+        now - server_state->last_check_perms_time < CHECK_FOLDER_PERMS_INTERVAL)
+        return;
+
+    for (ptr = repos; ptr; ptr = ptr->next) {
+        repo = ptr->data;
+
+        if (g_strcmp0 (host, repo->server_url) != 0)
+            continue;
+
+        token = seaf_repo_manager_get_repo_property (seaf->repo_mgr,
+                                                     repo->id, SEAF_REPO_TOKEN);
+        if (!token)
+            continue;
+
+        timestamp = seaf_repo_manager_get_folder_perm_timestamp (seaf->repo_mgr,
+                                                                 repo->id);
+        if (timestamp < 0)
+            timestamp = 0;
+
+        req = g_new0 (HttpFolderPermReq, 1);
+        memcpy (req->repo_id, repo->id, 36);
+        req->token = g_strdup(token);
+        req->timestamp = timestamp;
+
+        requests = g_list_append (requests, req);
+    }
+
+    if (!requests)
+        return;
+
+    server_state->last_check_perms_time = now;
+    server_state->checking_folder_perms = TRUE;
+
+    /* The requests list will be freed in http tx manager. */
+    http_tx_manager_get_folder_perms (seaf->http_tx_mgr,
+                                      host,
+                                      requests,
+                                      check_folder_perms_done,
+                                      server_state);
+}
+
+static void
+check_folder_permissions (SeafSyncManager *mgr, GList *repos)
+{
+    GHashTableIter iter;
+    gpointer key, value;
+    char *host;
+    HttpServerState *state;
+
+    g_hash_table_iter_init (&iter, mgr->http_server_states);
+    while (g_hash_table_iter_next (&iter, &key, &value)) {
+        host = key;
+        state = value;
+        check_folder_permissions_one_server (mgr, host, state, repos);
+    }
+}
+
 static int
 auto_sync_pulse (void *vmanager)
 {
     SeafSyncManager *manager = vmanager;
     GList *repos, *ptr;
     SeafRepo *repo;
+    gint64 now;
 
     repos = seaf_repo_manager_get_repo_list (manager->seaf->repo_mgr, -1, -1);
+
+    check_folder_permissions (manager, repos);
 
     /* Sort repos by last_sync_time, so that we don't "starve" any repo. */
     repos = g_list_sort_with_data (repos, cmp_repos_by_sync_time, NULL);
@@ -2332,7 +2451,7 @@ auto_sync_pulse (void *vmanager)
             if (repo->checking_locked_files)
                 continue;
 
-            int now = (int)time(NULL);
+            now = (gint64)time(NULL);
             if (repo->last_check_locked_time == 0 ||
                 now - repo->last_check_locked_time >= CHECK_LOCKED_FILES_INTERVAL)
             {
