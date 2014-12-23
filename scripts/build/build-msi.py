@@ -312,6 +312,8 @@ class SeafileClient(Project):
             'cmake -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=%s .' % to_mingw_path(self.prefix),
             get_make_path(),
             '%s install' % get_make_path(),
+            'make -C extension',
+            'make -C extension x64',
         ]
 
     def get_version(self):
@@ -632,7 +634,9 @@ def copy_dll_exe():
         os.path.join(prefix, 'bin', 'libseafile-0.dll'),
         os.path.join(prefix, 'bin', 'ccnet.exe'),
         os.path.join(prefix, 'bin', 'seaf-daemon.exe'),
-        os.path.join(SeafileClient().projdir, 'seafile-applet.exe')
+        os.path.join(SeafileClient().projdir, 'seafile-applet.exe'),
+        os.path.join(SeafileClient().projdir, 'ext', 'seafile_shell_ext.dll'),
+        os.path.join(SeafileClient().projdir, 'ext', 'seafile_shell_ext64.dll'),
     ]
 
     for name in filelist:
