@@ -25,6 +25,9 @@ typedef struct HttpServer {
     GHashTable *perm_cache;
     pthread_mutex_t perm_cache_lock; /* repo_id:username -> permission */
 
+    GHashTable *vir_repo_id_cache;
+    pthread_mutex_t vir_repo_id_cache_lock;
+
     event_t *reap_timer;
 
     struct _SeafileSession *seaf_session;
